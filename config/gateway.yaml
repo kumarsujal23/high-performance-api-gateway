@@ -1,0 +1,58 @@
+# High-Performance API Gateway configuration.
+# Minimal YAML subset — see src/config/Config.cpp for exactly what's parsed.
+
+listen:
+  host: 0.0.0.0
+  port: 8080
+
+workers: 4
+metrics_port: 9090
+
+rate_limit:
+  capacity: 200
+  refill_per_second: 100
+
+cache:
+  capacity: 1000
+  ttl_ms: 5000
+
+circuit_breaker:
+  failure_threshold: 5
+  reset_timeout_ms: 10000
+
+retry:
+  max_retries: 2
+  base_delay_ms: 50
+  max_delay_ms: 1000
+
+connection:
+  connect_timeout_ms: 1000
+  backend_read_timeout_ms: 3000
+  max_idle_per_backend: 32
+
+health_check:
+  interval_ms: 5000
+  timeout_ms: 1000
+  path: /health
+
+backend_groups:
+  - name: users_service
+    strategy: round_robin
+    backends:
+      - host: 127.0.0.1
+        port: 9001
+      - host: 127.0.0.1
+        port: 9002
+  - name: orders_service
+    strategy: least_connections
+    backends:
+      - host: 127.0.0.1
+        port: 9003
+
+routes:
+  - path_prefix: /api/users
+    backend_group: users_service
+    cacheable: true
+  - path_prefix: /api/orders
+    backend_group: orders_service
+    cacheable: false

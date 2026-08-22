@@ -1,0 +1,29 @@
+# CMake and generated build trees
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+_deps/
+Testing/
+compile_commands.json
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Runtime output
+*.log
+
+# Local environment and editor files
+.env
+.vscode/
+.idea/
