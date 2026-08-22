@@ -1,8 +1,7 @@
 # High-Performance API Gateway (C++20, Linux)
 
 A reverse-proxy / API gateway built from scratch on raw POSIX sockets +
-epoll, written to be **explainable component-by-component** in an
-SWE/HFT-style interview — not to compete with nginx/Envoy on features.
+epoll
 
 Every subsystem in the pipeline below is a separate, independently unit
 tested C++ class with no hidden magic:
@@ -131,7 +130,7 @@ backend groups (each with a load-balancing strategy), and path-prefix
 routes mapping to those groups. See the file for the full schema — it's
 intentionally small.
 
-## Design tradeoffs (things I'd explain in an interview)
+## Design tradeoffs
 
 **Thread-per-core with SO_REUSEPORT, not a single shared event loop.**
 Each worker thread owns its own epoll instance *and* its own listening
