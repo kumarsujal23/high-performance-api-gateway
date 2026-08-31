@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <csignal>
 #include <cstring>
+#include <charconv>
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <iostream>
 
@@ -46,7 +49,10 @@ public:
             loop_.poll(200 /*ms*/);
         }
 
-        for (auto& [fd, conn] : conns_) close(fd);
+        std::vector<int> openFds;
+        openFds.reserve(conns_.size());
+        for (const auto& [fd, conn] : conns_) openFds.push_back(fd);
+        for (int fd : openFds) closeConnection(fd);
     }
 
 private:
@@ -187,6 +193,7 @@ private:
     }
 
     void queueResponse(ClientConnection& conn, const HttpResponse& resp, bool closeAfter) {
+        Metrics::instance().recordResponse(resp.statusCode);
         conn.pendingWrite += resp.serialize(!closeAfter);
         conn.closeAfterWrite = closeAfter;
     }
@@ -269,6 +276,34 @@ Gateway::Gateway(GatewayConfig cfg)
 
 Gateway::~Gateway() { stop(); }
 
+void Gateway::runMetricsServer() {
+    try {
+        TcpServer server(cfg_.listenHost, cfg_.metricsPort);
+        Logger::instance().info("metrics server started", "\"port\":" + std::to_string(cfg_.metricsPort));
+        while (running_.load(std::memory_order_relaxed)) {
+            pollfd pfd{server.fd(), POLLIN, 0};
+            int ready = ::poll(&pfd, 1, 200);
+            if (ready <= 0) continue;
+            server.acceptAll([this](int fd, const std::string&) {
+                double uptime = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime_).count();
+                HttpResponse response = HttpResponse::make(200, "OK", Metrics::instance().toPrometheusText(uptime));
+                response.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+                response.setHeader("Connection", "close");
+                std::string wire = response.serialize(false);
+                size_t sent = 0;
+                while (sent < wire.size()) {
+                    ssize_t n = ::send(fd, wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL);
+                    if (n <= 0) break;
+                    sent += static_cast<size_t>(n);
+                }
+                ::close(fd);
+            });
+        }
+    } catch (const std::exception& e) {
+        Logger::instance().error(std::string("metrics server stopped: ") + e.what());
+    }
+}
+
 void Gateway::buildRouter() {
     for (auto& group : cfg_.backendGroups) {
         std::vector<std::shared_ptr<Backend>> backends;
@@ -309,7 +344,10 @@ std::string buildBackendRequest(const HttpRequest& req, const Backend& backend) 
     oss << req.method << " " << req.path << (req.query.empty() ? "" : "?" + req.query) << " HTTP/1.1\r\n";
     oss << "Host: " << backend.host << "\r\n";
     for (auto& [k, v] : req.headers) {
-        if (k == "connection" || k == "host") continue; // gateway controls these
+        // RFC 9110 hop-by-hop fields must never be forwarded verbatim.
+        if (k == "connection" || k == "host" || k == "keep-alive" || k == "proxy-connection" ||
+            k == "te" || k == "trailer" || k == "transfer-encoding" || k == "upgrade" ||
+            k == "content-length") continue;
         oss << k << ": " << v << "\r\n";
     }
     oss << "X-Request-Id: " << req.requestId << "\r\n";
@@ -323,7 +361,19 @@ std::string buildBackendRequest(const HttpRequest& req, const Backend& backend) 
 // Returns false on any I/O error or timeout. On success, fills statusCode
 // and body via a tiny inline status-line/header/body reader (separate from
 // HttpParser, which is client-request-shaped).
-bool sendAndReceive(int fd, const std::string& request, int timeoutMs, HttpResponse& out) {
+bool isConnectionClose(const std::string& value) {
+    std::string lower;
+    lower.reserve(value.size());
+    for (unsigned char c : value) lower.push_back(static_cast<char>(std::tolower(c)));
+    return lower.find("close") != std::string::npos;
+}
+
+// Reads a length-delimited HTTP/1.x response. Chunked upstream responses are
+// deliberately rejected: the gateway does not dechunk, so forwarding one
+// would produce incorrect client framing.
+bool sendAndReceive(int fd, const std::string& request, int timeoutMs, size_t maxBodyBytes,
+                    HttpResponse& out, bool& reusable) {
+    reusable = false;
     size_t sent = 0;
     while (sent < request.size()) {
         pollfd pfd{fd, POLLOUT, 0};
@@ -341,7 +391,8 @@ bool sendAndReceive(int fd, const std::string& request, int timeoutMs, HttpRespo
     char buf[8192];
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     size_t headerEnd = std::string::npos;
-    long contentLength = -1;
+    size_t contentLength = 0;
+    bool gotContentLength = false;
 
     while (true) {
         int remainingMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -355,20 +406,42 @@ bool sendAndReceive(int fd, const std::string& request, int timeoutMs, HttpRespo
         raw.append(buf, static_cast<size_t>(n));
 
         if (headerEnd == std::string::npos) {
+            if (raw.size() > 32768) return false;
             headerEnd = raw.find("\r\n\r\n");
             if (headerEnd != std::string::npos) {
-                size_t clPos = raw.find("Content-Length:");
-                if (clPos == std::string::npos) clPos = raw.find("content-length:");
-                if (clPos != std::string::npos && clPos < headerEnd) {
-                    contentLength = std::strtol(raw.c_str() + clPos + 15, nullptr, 10);
-                } else {
-                    contentLength = 0;
+                size_t lineStart = raw.find("\r\n") + 2;
+                while (lineStart < headerEnd) {
+                    size_t lineEnd = raw.find("\r\n", lineStart);
+                    if (lineEnd == std::string::npos || lineEnd > headerEnd) return false;
+                    std::string line = raw.substr(lineStart, lineEnd - lineStart);
+                    size_t colon = line.find(':');
+                    if (colon == std::string::npos) return false;
+                    std::string key = line.substr(0, colon);
+                    std::string value = line.substr(colon + 1);
+                    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+                    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+                    if (key == "content-length") {
+                        if (gotContentLength) return false;
+                        const char* first = value.data();
+                        const char* last = first + value.size();
+                        auto [end, ec] = std::from_chars(first, last, contentLength);
+                        if (ec != std::errc{} || end != last || contentLength > maxBodyBytes) return false;
+                        gotContentLength = true;
+                    } else if (key == "transfer-encoding") {
+                        return false;
+                    } else if (key == "connection") {
+                        reusable = !isConnectionClose(value);
+                    } else if (key != "keep-alive" && key != "proxy-connection" && key != "upgrade") {
+                        out.headers.emplace_back(std::move(key), std::move(value));
+                    }
+                    lineStart = lineEnd + 2;
                 }
+                if (!gotContentLength) return false;
             }
         }
         if (headerEnd != std::string::npos) {
             size_t bodyBytes = raw.size() - (headerEnd + 4);
-            if (contentLength <= 0 || static_cast<long>(bodyBytes) >= contentLength) break;
+            if (bodyBytes >= contentLength) break;
         }
     }
 
@@ -380,7 +453,7 @@ bool sendAndReceive(int fd, const std::string& request, int timeoutMs, HttpRespo
     out.statusCode = std::atoi(raw.substr(firstSpace + 1, secondSpace - firstSpace - 1).c_str());
     size_t lineEnd = raw.find("\r\n");
     out.statusText = raw.substr(secondSpace + 1, lineEnd - secondSpace - 1);
-    out.body = raw.substr(headerEnd + 4);
+    out.body = raw.substr(headerEnd + 4, contentLength);
     return true;
 }
 
@@ -402,15 +475,17 @@ HttpResponse Gateway::forwardWithResilience(const routing::Route& route, HttpReq
         int fd = pool_.acquire(backend->host, backend->port);
         HttpResponse resp;
         bool ok = false;
+        bool reusable = false;
         if (fd >= 0) {
             std::string wire = buildBackendRequest(req, *backend);
-            ok = sendAndReceive(fd, wire, cfg_.backendReadTimeoutMs, resp);
+            ok = sendAndReceive(fd, wire, cfg_.backendReadTimeoutMs, cfg_.maxResponseBodyBytes, resp, reusable);
         }
         backend->activeConnections.fetch_sub(1, std::memory_order_relaxed);
 
         if (ok) {
             backend->circuitBreaker->onSuccess();
-            pool_.release(backend->host, backend->port, fd);
+            if (reusable) pool_.release(backend->host, backend->port, fd);
+            else pool_.discard(fd);
             if (resp.statusCode < 500) return resp;
             // 5xx counts as a resilience-relevant failure for retry purposes
             // but we still return it if we've exhausted retries below.
@@ -438,6 +513,7 @@ void Gateway::run() {
     running_ = true;
     startTime_ = std::chrono::steady_clock::now();
     healthChecker_->start();
+    metricsThread_ = std::thread([this] { runMetricsServer(); });
 
     Logger::instance().info("gateway starting",
         "\"port\":" + std::to_string(cfg_.listenPort) + ",\"workers\":" + std::to_string(cfg_.workerThreads));
@@ -449,12 +525,15 @@ void Gateway::run() {
         });
     }
     for (auto& t : workerThreads_) t.join();
+    workerThreads_.clear();
+    if (metricsThread_.joinable()) metricsThread_.join();
+    if (healthChecker_) healthChecker_->stop();
+    pool_.closeAll();
 }
 
 void Gateway::stop() {
     if (!running_.exchange(false)) return;
     if (healthChecker_) healthChecker_->stop();
-    pool_.closeAll();
 }
 
 } // namespace gw::core

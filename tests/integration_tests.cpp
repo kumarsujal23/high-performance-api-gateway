@@ -72,18 +72,22 @@ private:
 };
 
 std::string httpGet(int port, const std::string& path) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-    // Retry the connect briefly: the gateway's listener may still be
-    // starting up on its worker threads.
+    // Retry with a fresh socket: a failed connect leaves the old socket in
+    // an unspecified state on some kernels, which made this test flaky.
+    int fd = -1;
     for (int i = 0; i < 50; ++i) {
-        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0 && connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
+        if (fd >= 0) close(fd);
+        fd = -1;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (fd < 0) return {};
 
     std::string req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     send(fd, req.data(), req.size(), 0);

@@ -42,6 +42,7 @@ struct GatewayConfig {
 
     int connectTimeoutMs = 1000;
     int backendReadTimeoutMs = 3000;
+    size_t maxResponseBodyBytes = 10 * 1024 * 1024;
     size_t maxIdleConnsPerBackend = 16;
 
     int healthCheckIntervalMs = 5000;

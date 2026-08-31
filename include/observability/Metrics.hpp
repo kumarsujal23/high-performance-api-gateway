@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <sstream>
+#include <array>
 
 namespace gw::observability {
 
@@ -73,6 +74,11 @@ public:
     void incRateLimited() { rateLimited_.fetch_add(1, std::memory_order_relaxed); }
     void incRetries() { retries_.fetch_add(1, std::memory_order_relaxed); }
     void incCircuitOpen() { circuitOpenRejections_.fetch_add(1, std::memory_order_relaxed); }
+    void recordResponse(int statusCode) {
+        if (statusCode >= 100 && statusCode < 600) {
+            responsesByClass_[static_cast<size_t>(statusCode / 100)].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     void connectionOpened() { activeConnections_.fetch_add(1, std::memory_order_relaxed); }
     void connectionClosed() { activeConnections_.fetch_sub(1, std::memory_order_relaxed); }
@@ -92,8 +98,15 @@ public:
     std::string toPrometheusText(double uptimeSeconds) const {
         std::ostringstream oss;
         oss << "# HELP gateway_requests_total Total requests handled\n";
+        oss << "# TYPE gateway_requests_total counter\n";
         oss << "gateway_requests_total " << requests() << "\n";
+        oss << "# TYPE gateway_errors_total counter\n";
         oss << "gateway_errors_total " << errors() << "\n";
+        oss << "# TYPE gateway_responses_total counter\n";
+        for (size_t klass = 1; klass <= 5; ++klass) {
+            oss << "gateway_responses_total{status_class=\"" << klass << "xx\"} "
+                << responsesByClass_[klass].load(std::memory_order_relaxed) << "\n";
+        }
         oss << "gateway_cache_hits_total " << cacheHits_.load() << "\n";
         oss << "gateway_cache_misses_total " << cacheMisses_.load() << "\n";
         oss << "gateway_rate_limited_total " << rateLimited_.load() << "\n";
@@ -119,6 +132,7 @@ private:
     std::atomic<uint64_t> retries_{0};
     std::atomic<uint64_t> circuitOpenRejections_{0};
     std::atomic<int64_t> activeConnections_{0};
+    std::array<std::atomic<uint64_t>, 6> responsesByClass_{};
     LatencyHistogram latency_;
 };
 

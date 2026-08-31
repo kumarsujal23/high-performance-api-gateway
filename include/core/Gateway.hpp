@@ -50,6 +50,7 @@ private:
     friend class Worker;
 
     void buildRouter();
+    void runMetricsServer();
     gw::http::HttpResponse forwardWithResilience(const gw::routing::Route& route, gw::http::HttpRequest& req);
 
     gw::config::GatewayConfig cfg_;
@@ -64,6 +65,7 @@ private:
     std::unique_ptr<gw::network::HealthChecker> healthChecker_;
 
     std::vector<std::thread> workerThreads_;
+    std::thread metricsThread_;
     std::atomic<bool> running_{false};
     std::chrono::steady_clock::time_point startTime_;
 };

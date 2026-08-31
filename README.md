@@ -41,8 +41,8 @@ Backend Service
 ```
 
 Cutting across all of this: structured JSON logs, per-request IDs,
-Prometheus-style metrics (RPS, active connections, errors, p50/p95/p99
-latency), and a background health checker.
+Prometheus-style metrics on a dedicated listener (RPS, status classes, active
+connections, errors, p50/p95/p99 latency), and a background health checker.
 
 ## What this is / is not
 
@@ -70,7 +70,7 @@ include/ , src/          headers / implementations, one subsystem per folder
   resilience/             RateLimiter (token bucket), CircuitBreaker, RetryPolicy
   cache/                  LRUCache (thread-safe, TTL)
   observability/          Logger (structured JSON), Metrics (atomics + latency histogram), RequestId
-  config/                 GatewayConfig + minimal YAML-subset parser
+  config/                 GatewayConfig + validated YAML-subset parser
 tests/                    GoogleTest unit + integration tests (one file per subsystem)
 benchmarks/               Dependency-free HTTP load generator
 backends/                 Minimal test backend (supports injected latency/failure for chaos testing)
@@ -78,6 +78,76 @@ config/gateway.yaml       Example configuration
 ```
 
 ## Building
+
+## Verify locally in VS Code (Windows + WSL)
+
+This is a Linux-only project: it uses `epoll` and POSIX sockets. On Windows,
+install the VS Code **Remote - WSL** extension, then open the repository from
+a WSL terminal instead of a PowerShell terminal:
+
+```bash
+cd /mnt/c/Users/<your-user>/Desktop/gw
+code .
+```
+
+Use the VS Code terminal (running in WSL) for the following commands.
+
+### 1. Release build and test suite
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Expected result: `100% tests passed` (currently 47 tests).
+
+### 2. Sanitizer validation
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DENABLE_SANITIZERS=ON
+cmake --build build-asan --parallel
+ctest --test-dir build-asan --output-on-failure
+```
+
+This runs the same suite under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+### 3. Manual gateway smoke test
+
+Open four VS Code terminals. Run one command in each of the first three:
+
+```bash
+# Terminal 1
+./build/backend_server 9001 --name svc-a
+
+# Terminal 2
+./build/backend_server 9002 --name svc-b
+
+# Terminal 3
+./build/gateway config/gateway.yaml
+```
+
+Then use Terminal 4:
+
+```bash
+curl -i http://127.0.0.1:8080/api/users/42
+curl -i http://127.0.0.1:8080/gateway/health
+curl http://127.0.0.1:9090/metrics
+```
+
+Repeat the first request to observe round-robin responses from `svc-a` and
+`svc-b`. Stop each process with `Ctrl+C`.
+
+### 4. Benchmark
+
+```bash
+./build/gateway_benchmark 127.0.0.1 8080 /api/users/42 16 10
+```
+
+The default per-IP rate limit is intentionally low for a public gateway, so
+use a high-limit test configuration when publishing benchmark results. Record
+the successful 2xx throughput, response-class counts, transport errors, and
+p50/p95/p99 latency; do not treat 5xx responses as successes.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -100,7 +170,7 @@ cmake --build build-tests --parallel
 cd build-tests && ctest --output-on-failure
 ```
 
-Sanitizer build (ASan + UBSan), all 40 tests pass clean with zero warnings:
+Sanitizer build (ASan + UBSan):
 
 ```bash
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DENABLE_SANITIZERS=ON
@@ -120,11 +190,11 @@ cd build-asan && ctest --output-on-failure
 
 # Terminal 3
 curl http://localhost:8080/api/users/42
-curl http://localhost:8080/metrics       # Prometheus-format counters + latency percentiles
+curl http://localhost:9090/metrics       # dedicated Prometheus endpoint
 curl http://localhost:8080/gateway/health
 ```
 
-`config/gateway.yaml` defines listen address/port, worker thread count,
+`config/gateway.yaml` defines listen/metrics ports, worker thread count,
 rate-limit/cache/circuit-breaker/retry/timeout knobs, one or more named
 backend groups (each with a load-balancing strategy), and path-prefix
 routes mapping to those groups. See the file for the full schema — it's
@@ -185,6 +255,25 @@ dependency for a handful of nested lists and key/value pairs. The parser
 (`src/config/Config.cpp`) explicitly documents that it's a *subset*, not
 general YAML.
 
+**Safe upstream connection reuse.** Backend response headers are parsed and
+hop-by-hop fields are removed before forwarding. A socket is returned to the
+pool only when the upstream explicitly allows persistence; responses with
+`Connection: close` are discarded. This avoids reusing a half-closed socket,
+which is a common source of intermittent proxy failures.
+
+## Container demo
+
+Run the gateway with two local backends:
+
+```bash
+docker compose up --build
+curl http://localhost:8080/api/users/42
+curl http://localhost:9090/metrics
+```
+
+The repository also includes GitHub Actions for release and ASan/UBSan test
+builds on every push and pull request.
+
 ## Testing
 
 - **Unit tests**: `HttpParser` (incremental delivery, pipelining, malformed
@@ -198,7 +287,8 @@ general YAML.
   `Gateway` API), and verify the full accept → parse → route → proxy →
   respond pipeline, including the 502/503 backend-failure path and 404
   routing.
-- 44/44 tests pass, including under `-fsanitize=address,undefined`.
+- 47/47 tests pass, including parser tests for duplicate `Content-Length`,
+  ambiguous `Content-Length` + `Transfer-Encoding`, and unsupported versions.
 
 ## Benchmarking
 
@@ -211,33 +301,8 @@ a fixed duration, recording per-request latency:
 ./build/gateway_benchmark <host> <port> <path> <connections> <duration_s> [--no-keepalive]
 ```
 
-**Real numbers from this run** (single container, 4 vCPU equivalent,
-gateway + backend + benchmark client all colocated on loopback — so these
-are directional, not representative of production hardware; re-run
-`gateway_benchmark` on your own machine for numbers you can cite):
-
-| Configuration                                   | Throughput   | p50      | p95      | p99      |
-|--------------------------------------------------|-------------:|---------:|---------:|---------:|
-| 1 connection, keep-alive, 4 workers               |  424 req/s   |  2.4 ms  |  4.4 ms  |  4.4 ms  |
-| 4 connections, keep-alive, 4 workers              | 1409 req/s   |  2.5 ms  |  6.8 ms  |  9.1 ms  |
-| 32 connections, keep-alive, 4 workers             | 1813 req/s   | 17.1 ms  | 29.7 ms  | 42.5 ms  |
-| 32 connections, **no** keep-alive, 4 workers      | 1787 req/s   | 15.8 ms  | 41.7 ms  | 49.7 ms  |
-| 32 connections, keep-alive, **1 worker**          |  439 req/s   | 72.2 ms  | 86.4 ms  | 135.4 ms |
-
-Takeaways, and why they follow from the design:
-- **Worker count matters a lot** (1813 vs 439 req/s, 4x): confirms the
-  synchronous-backend-I/O tradeoff above — with 1 worker, every proxied
-  request briefly stalls *all* other connections on that single thread;
-  with 4 workers the stalls are spread out and mostly overlap.
-- **Keep-alive vs. no keep-alive was roughly a wash at 32 connections** in
-  this environment (1813 vs 1787 req/s) — at this concurrency and on
-  loopback, connection setup cost isn't the bottleneck (backend round-trip
-  time dominates); the gap would be expected to widen over a real network
-  with non-trivial RTT/handshake cost, or at lower concurrency where
-  handshake overhead is a bigger fraction of total time.
-- Throughput does not scale linearly from 4→32 connections (1409 → 1813, a
-  1.3x for 8x the connections) — consistent with 4 worker threads being
-  the saturating resource once concurrency exceeds the worker count.
-
-No numbers in this table are invented — they're outputs of the exact
-command line shown above run against this exact build in this environment.
+The benchmark reports total responses, 2xx responses, each response-class
+count, and transport errors separately. It does **not** count a 5xx response
+as a successful request. Record the host, worker count, backend setup,
+connections, duration, and status-class breakdown with every published run;
+loopback figures are useful for regression detection, not production claims.

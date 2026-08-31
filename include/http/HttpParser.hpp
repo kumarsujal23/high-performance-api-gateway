@@ -28,12 +28,13 @@ public:
     // untouched so the caller can append more data and retry.
     ParseStatus parse(HttpRequest& out);
 
-    void reset() { buffer_.clear(); state_ = State::RequestLine; }
+    void reset() { buffer_.clear(); state_ = State::RequestLine; consumed_ = 0; headers_.clear(); headerCount_ = 0; }
 
     size_t bufferedBytes() const { return buffer_.size(); }
 
     static constexpr size_t kMaxRequestLineLen = 8192;
     static constexpr size_t kMaxHeaderBytes = 32768;
+    static constexpr size_t kMaxHeaderCount = 100;
     static constexpr size_t kMaxBodyBytes = 10 * 1024 * 1024; // 10MB
 
 private:
@@ -47,6 +48,7 @@ private:
     std::unordered_map<std::string, std::string> headers_;
     size_t contentLength_ = 0;
     bool chunked_ = false;
+    size_t headerCount_ = 0;
     size_t consumed_ = 0;
 
     bool parseRequestLine(size_t& pos);

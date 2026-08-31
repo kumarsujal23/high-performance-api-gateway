@@ -1,0 +1,19 @@
+services:
+  backend-a:
+    build:
+      context: .
+      target: build
+    command: ["/build/backend_server", "9001", "--name", "users-a"]
+
+  backend-b:
+    build:
+      context: .
+      target: build
+    command: ["/build/backend_server", "9002", "--name", "users-b"]
+
+  gateway:
+    build: .
+    depends_on: [backend-a, backend-b]
+    ports:
+      - "8080:8080"
+      - "9090:9090"

@@ -20,12 +20,14 @@
 #include <chrono>
 #include <algorithm>
 #include <mutex>
+#include <array>
 
 namespace {
 
 struct WorkerStats {
-    uint64_t requests = 0;
-    uint64_t errors = 0;
+    uint64_t successfulRequests = 0;
+    uint64_t transportErrors = 0;
+    std::array<uint64_t, 6> responsesByClass{};
     std::vector<double> latenciesMs;
 };
 
@@ -47,14 +49,20 @@ int connectTo(const std::string& host, int port) {
 // Sends one GET request on fd and reads the full response. Returns false on
 // any I/O error (caller should reconnect). If keepAlive is false, closes and
 // returns fd = -1 via output param.
-bool doRequest(int& fd, const std::string& host, int port, const std::string& path, bool keepAlive) {
+bool doRequest(int& fd, const std::string& host, int port, const std::string& path, bool keepAlive,
+               int& statusCode) {
     if (fd < 0) {
         fd = connectTo(host, port);
         if (fd < 0) return false;
     }
     std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " +
                        (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
-    if (send(fd, req.data(), req.size(), 0) < 0) { close(fd); fd = -1; return false; }
+    size_t sent = 0;
+    while (sent < req.size()) {
+        ssize_t n = send(fd, req.data() + sent, req.size() - sent, 0);
+        if (n <= 0) { close(fd); fd = -1; return false; }
+        sent += static_cast<size_t>(n);
+    }
 
     std::string raw;
     char buf[8192];
@@ -78,7 +86,10 @@ bool doRequest(int& fd, const std::string& host, int port, const std::string& pa
         }
     }
     if (!keepAlive) { close(fd); fd = -1; }
-    return true;
+    size_t firstSpace = raw.find(' ');
+    if (firstSpace == std::string::npos || firstSpace + 4 > raw.size()) return false;
+    statusCode = std::atoi(raw.c_str() + firstSpace + 1);
+    return statusCode >= 100 && statusCode <= 599;
 }
 
 void workerLoop(const std::string& host, int port, const std::string& path, bool keepAlive,
@@ -86,13 +97,17 @@ void workerLoop(const std::string& host, int port, const std::string& path, bool
     int fd = -1;
     while (std::chrono::steady_clock::now() < deadline) {
         auto start = std::chrono::steady_clock::now();
-        bool ok = doRequest(fd, host, port, path, keepAlive);
+        int statusCode = 0;
+        bool gotResponse = doRequest(fd, host, port, path, keepAlive, statusCode);
         auto end = std::chrono::steady_clock::now();
-        if (ok) {
-            stats.requests++;
+        if (gotResponse) {
+            stats.responsesByClass[static_cast<size_t>(statusCode / 100)]++;
+            if (statusCode >= 200 && statusCode < 300) {
+                stats.successfulRequests++;
+            }
             stats.latenciesMs.push_back(std::chrono::duration<double, std::milli>(end - start).count());
         } else {
-            stats.errors++;
+            stats.transportErrors++;
         }
     }
     if (fd >= 0) close(fd);
@@ -134,20 +149,28 @@ int main(int argc, char** argv) {
     for (auto& t : threads) t.join();
     double wallSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
 
-    uint64_t totalRequests = 0, totalErrors = 0;
+    uint64_t totalSuccessfulRequests = 0, totalTransportErrors = 0;
+    std::array<uint64_t, 6> responsesByClass{};
     std::vector<double> allLatencies;
     for (auto& s : stats) {
-        totalRequests += s.requests;
-        totalErrors += s.errors;
+        totalSuccessfulRequests += s.successfulRequests;
+        totalTransportErrors += s.transportErrors;
+        for (size_t i = 1; i <= 5; ++i) responsesByClass[i] += s.responsesByClass[i];
         allLatencies.insert(allLatencies.end(), s.latenciesMs.begin(), s.latenciesMs.end());
     }
     std::sort(allLatencies.begin(), allLatencies.end());
 
     std::cout << "\n--- Results ---\n";
-    std::cout << "Total requests: " << totalRequests << "\n";
-    std::cout << "Errors: " << totalErrors << "\n";
+    uint64_t totalResponses = 0;
+    for (size_t i = 1; i <= 5; ++i) totalResponses += responsesByClass[i];
+    std::cout << "Total responses: " << totalResponses << "\n";
+    std::cout << "Successful (2xx) responses: " << totalSuccessfulRequests << "\n";
+    std::cout << "Transport errors: " << totalTransportErrors << "\n";
+    for (size_t i = 1; i <= 5; ++i) {
+        if (responsesByClass[i] > 0) std::cout << i << "xx responses: " << responsesByClass[i] << "\n";
+    }
     std::cout << "Wall time: " << wallSeconds << "s\n";
-    std::cout << "Throughput: " << (totalRequests / wallSeconds) << " req/s\n";
+    std::cout << "Successful throughput: " << (totalSuccessfulRequests / wallSeconds) << " req/s\n";
     if (!allLatencies.empty()) {
         std::cout << "Latency p50: " << percentile(allLatencies, 0.50) << " ms\n";
         std::cout << "Latency p95: " << percentile(allLatencies, 0.95) << " ms\n";

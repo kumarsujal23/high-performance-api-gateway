@@ -64,6 +64,12 @@ public:
         }
     }
 
+    void clear() {
+        std::lock_guard<std::mutex> lock(mu_);
+        list_.clear();
+        index_.clear();
+    }
+
     size_t size() const {
         std::lock_guard<std::mutex> lock(mu_);
         return index_.size();

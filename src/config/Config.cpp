@@ -125,6 +125,7 @@ GatewayConfig GatewayConfig::loadFromFile(const std::string& path) {
             auto [key, val] = splitKv(ln.content);
             if (key == "connect_timeout_ms") cfg.connectTimeoutMs = toInt(val, cfg.connectTimeoutMs);
             else if (key == "backend_read_timeout_ms") cfg.backendReadTimeoutMs = toInt(val, cfg.backendReadTimeoutMs);
+            else if (key == "max_response_body_bytes") cfg.maxResponseBodyBytes = static_cast<size_t>(toInt(val, static_cast<int>(cfg.maxResponseBodyBytes)));
             else if (key == "max_idle_per_backend") cfg.maxIdleConnsPerBackend = static_cast<size_t>(toInt(val, static_cast<int>(cfg.maxIdleConnsPerBackend)));
         } else if (section == "health_check") {
             auto [key, val] = splitKv(ln.content);
@@ -174,6 +175,29 @@ GatewayConfig GatewayConfig::loadFromFile(const std::string& path) {
         }
     }
 
+    if (cfg.listenPort <= 0 || cfg.listenPort > 65535 || cfg.metricsPort <= 0 || cfg.metricsPort > 65535 ||
+        cfg.workerThreads <= 0 || cfg.rateLimitCapacity <= 0 || cfg.rateLimitRefillPerSecond <= 0 ||
+        cfg.maxResponseBodyBytes == 0 || cfg.backendReadTimeoutMs <= 0 || cfg.connectTimeoutMs <= 0) {
+        throw std::runtime_error("invalid gateway configuration values");
+    }
+    if (cfg.listenPort == cfg.metricsPort) throw std::runtime_error("listen and metrics ports must differ");
+    if (cfg.backendGroups.empty() || cfg.routes.empty()) throw std::runtime_error("at least one backend group and route are required");
+    for (const auto& group : cfg.backendGroups) {
+        if (group.name.empty() || group.backends.empty() ||
+            (group.strategy != "round_robin" && group.strategy != "least_connections")) {
+            throw std::runtime_error("invalid backend group configuration");
+        }
+        for (const auto& backend : group.backends) {
+            if (backend.host.empty() || backend.port <= 0 || backend.port > 65535) {
+                throw std::runtime_error("invalid backend address");
+            }
+        }
+    }
+    for (const auto& route : cfg.routes) {
+        if (route.pathPrefix.empty() || route.pathPrefix[0] != '/' || route.backendGroup.empty()) {
+            throw std::runtime_error("invalid route configuration");
+        }
+    }
     return cfg;
 }
 

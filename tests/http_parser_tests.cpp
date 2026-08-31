@@ -112,3 +112,29 @@ TEST(HttpParserTest, RejectsInvalidContentLength) {
     HttpRequest req;
     EXPECT_EQ(parser.parse(req), ParseStatus::Error);
 }
+
+TEST(HttpParserTest, RejectsAmbiguousRequestFraming) {
+    HttpParser parser;
+    std::string raw = "POST /submit HTTP/1.1\r\nContent-Length: 4\r\n"
+                      "Transfer-Encoding: chunked\r\n\r\n";
+    parser.append(raw.data(), raw.size());
+    HttpRequest req;
+    EXPECT_EQ(parser.parse(req), ParseStatus::Error);
+}
+
+TEST(HttpParserTest, RejectsDuplicateContentLength) {
+    HttpParser parser;
+    std::string raw = "POST /submit HTTP/1.1\r\nContent-Length: 4\r\n"
+                      "Content-Length: 5\r\n\r\ntest";
+    parser.append(raw.data(), raw.size());
+    HttpRequest req;
+    EXPECT_EQ(parser.parse(req), ParseStatus::Error);
+}
+
+TEST(HttpParserTest, RejectsUnsupportedHttpVersion) {
+    HttpParser parser;
+    std::string raw = "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n";
+    parser.append(raw.data(), raw.size());
+    HttpRequest req;
+    EXPECT_EQ(parser.parse(req), ParseStatus::Error);
+}

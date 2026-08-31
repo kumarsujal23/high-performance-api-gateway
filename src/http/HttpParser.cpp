@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <charconv>
 #include <stdexcept>
 
 namespace gw::http {
@@ -35,6 +36,17 @@ bool HttpParser::parseRequestLine(size_t& pos) {
     method_ = line.substr(0, sp1);
     std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     version_ = line.substr(sp2 + 1);
+    if (version_ != "HTTP/1.1" && version_ != "HTTP/1.0") {
+        throw std::runtime_error("unsupported HTTP version");
+    }
+    if (method_.empty() || !std::all_of(method_.begin(), method_.end(), [](unsigned char c) {
+            return std::isupper(c) || std::isdigit(c) || c == '-' || c == '_';
+        })) {
+        throw std::runtime_error("invalid HTTP method");
+    }
+    if (target.empty() || target[0] != '/' || target.find_first_of("\r\n") != std::string::npos) {
+        throw std::runtime_error("invalid request target");
+    }
 
     size_t q = target.find('?');
     if (q == std::string::npos) {
@@ -66,7 +78,20 @@ bool HttpParser::parseHeaders(size_t& pos) {
         if (colon == std::string::npos) throw std::runtime_error("malformed header");
         std::string key = toLower(trim(line.substr(0, colon)));
         std::string value = trim(line.substr(colon + 1));
+        if (key.empty() || key.find_first_of(" \t\r\n") != std::string::npos ||
+            value.find_first_of("\r\n") != std::string::npos) {
+            throw std::runtime_error("invalid header");
+        }
+        if (++headerCount_ > kMaxHeaderCount) throw std::runtime_error("too many headers");
+        // Duplicated framing/routing headers are ambiguous. Other duplicate
+        // end-to-end fields remain valid HTTP and are coalesced here.
+        if (headers_.contains(key) && (key == "content-length" || key == "transfer-encoding" || key == "host")) {
+            throw std::runtime_error("duplicate framing header");
+        }
         headers_[key] = value;
+        // Preserve progress across fragmented headers. Without this, a
+        // slow client causes already-parsed lines to be processed repeatedly.
+        consumed_ = pos;
     }
 }
 
@@ -85,15 +110,19 @@ ParseStatus HttpParser::parse(HttpRequest& out) {
 
             auto clIt = headers_.find("content-length");
             if (clIt != headers_.end()) {
-                char* end = nullptr;
-                const char* value = clIt->second.c_str();
-                unsigned long parsed = std::strtoul(value, &end, 10);
-                if (end == value || *end != '\0') throw std::runtime_error("invalid content length");
-                contentLength_ = static_cast<size_t>(parsed);
+                size_t parsed = 0;
+                const char* first = clIt->second.data();
+                const char* last = first + clIt->second.size();
+                auto [end, ec] = std::from_chars(first, last, parsed);
+                if (ec != std::errc{} || end != last) throw std::runtime_error("invalid content length");
+                contentLength_ = parsed;
                 if (contentLength_ > kMaxBodyBytes) throw std::runtime_error("body too large");
             }
             auto teIt = headers_.find("transfer-encoding");
             chunked_ = (teIt != headers_.end() && toLower(teIt->second).find("chunked") != std::string::npos);
+            if (teIt != headers_.end() && clIt != headers_.end()) {
+                throw std::runtime_error("ambiguous request framing");
+            }
             if (chunked_) throw std::runtime_error("chunked transfer encoding is unsupported");
             state_ = State::Body;
         }
@@ -124,6 +153,7 @@ ParseStatus HttpParser::parse(HttpRequest& out) {
         headers_.clear();
         contentLength_ = 0;
         chunked_ = false;
+        headerCount_ = 0;
 
         return ParseStatus::Complete;
     } catch (const std::exception&) {
